@@ -8,13 +8,14 @@
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-v2.x-7C3AED?style=for-the-badge&logo=anthropic&logoColor=white)](https://modelcontextprotocol.io/)
 [![Transport](https://img.shields.io/badge/Transport-stdio-06B6D4?style=for-the-badge&logo=fastapi&logoColor=white)](https://modelcontextprotocol.io/)
 [![Security](https://img.shields.io/badge/Security-SSL%20%2F%20TLS-22C55E?style=for-the-badge&logo=letsencrypt&logoColor=white)](https://support.google.com/mail)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Donate-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/satyam404)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
 <br/>
 
 **A production-ready Model Context Protocol (MCP) server that empowers AI assistants (Antigravity, Claude, Cursor, Gemini) to securely read, draft, send, categorize, and organize Gmail with 14 specialized tools.**
 
-[Key Features](#-key-features) • [Tool Reference](#-tool-reference) • [Setup Guide](#-step-by-step-setup-guide) • [Integration](#-client-integration) • [Prompts](#-example-ai-prompts)
+[Key Features](#-key-features) • [Tool Reference](#-tool-reference) • [Setup Guide](#-step-by-step-setup-guide) • [Integration](#-client-integration) • [Prompts](#-example-ai-prompts) • [Support](#-support--sponsor)
 
 ---
 
@@ -172,11 +173,37 @@ Once connected to your AI assistant, you can issue natural language commands:
 ```
 gmail-manager/
 ├── banner.svg           # High-resolution vector banner for repo hero
+├── bmc_qr.png           # Buy Me a Coffee donation QR code
 ├── server.py            # Main MCP Server implementation (14 tools, MCP 2.x)
 ├── requirements.txt     # Python dependencies (mcp>=2.0.0)
 ├── .env.example         # Template for environment variables
+├── config.example.json  # Template for JSON configuration
 └── README.md            # Documentation & setup instructions
 ```
+
+---
+
+## ☕ Support & Sponsor
+
+If you find **Gmail Manager MCP** helpful and want to support its maintenance and ongoing development:
+
+<div align="center">
+
+<a href="https://buymeacoffee.com/satyam404" target="_blank">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="200" />
+</a>
+
+<br/><br/>
+
+<a href="https://buymeacoffee.com/satyam404" target="_blank">
+  <img src="./bmc_qr.png" alt="Scan to Buy Me A Coffee" width="170" style="border-radius: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.15);" />
+</a>
+
+<br/>
+
+<sub>Scan the QR code or click the button above to buy me a coffee! Thank you for your support! ☕✨</sub>
+
+</div>
 
 ---
 
