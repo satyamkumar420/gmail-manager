@@ -16,12 +16,15 @@ High-performance, pure Gmail management MCP server providing:
 12. generate_followup_template
 13. manage_labels
 14. get_mailbox_stats
+15. verify_email_deliverability
 """
 
 import os
 import sys
 import json
 import time
+import re
+from datetime import datetime
 import smtplib
 import imaplib
 import email
@@ -32,10 +35,15 @@ from email.mime.base import MIMEBase
 from email import encoders
 from typing import List, Dict, Any, Optional
 
-from mcp.server.mcpserver import MCPServer
+try:
+    import dns.resolver
+except ImportError:
+    dns = None
 
-# Initialize MCPServer
-mcp = MCPServer("gmail-manager")
+from mcp.server.fastmcp import FastMCP
+
+# Initialize FastMCP Server
+mcp = FastMCP("gmail-manager")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -76,6 +84,25 @@ def get_imap_client():
     imap = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"])
     imap.login(cfg["sender_email"], cfg["app_password"])
     return imap
+
+def format_imap_date(date_str: Optional[str]) -> Optional[str]:
+    """Formats ISO or freeform date string (YYYY-MM-DD, DD-Mon-YYYY, etc.) to standard IMAP date format (DD-Mon-YYYY)."""
+    if not date_str:
+        return None
+    cleaned = date_str.strip()
+    # Check if already in DD-Mon-YYYY format (e.g. 04-Sep-2026 or 4-Sep-2026)
+    match = re.match(r"^(\d{1,2})-([A-Za-z]{3})-(\d{4})$", cleaned)
+    if match:
+        day, month, year = match.groups()
+        return f"{int(day):02d}-{month.capitalize()}-{year}"
+        
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%B %d, %Y"):
+        try:
+            dt = datetime.strptime(cleaned, fmt)
+            return dt.strftime("%d-%b-%Y")
+        except ValueError:
+            continue
+    return None
 
 def decode_mime_words(raw_header: str) -> str:
     """Decodes MIME encoded header strings into readable UTF-8 text."""
@@ -124,27 +151,162 @@ def extract_body(msg: email.message.Message) -> Dict[str, str]:
         "html": html_content.strip()
     }
 
+def check_email_deliverability(email_addr: str, sender_email: str = "", timeout: int = 8) -> Dict[str, Any]:
+    """Performs deep pre-flight email deliverability validation:
+    1. RFC syntax format check
+    2. DNS MX records existence check
+    3. Zero-send SMTP handshake with the target MX server (RCPT TO probe)
+    4. Catch-all domain detection
+    """
+    cleaned_email = (email_addr or "").strip()
+    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+    if not re.match(pattern, cleaned_email):
+        return {
+            "email": cleaned_email,
+            "is_deliverable": False,
+            "status": "invalid_syntax",
+            "reason": "Malformed email address syntax."
+        }
+
+    domain = cleaned_email.split("@")[1].lower()
+
+    # DNS MX check
+    mxs = []
+    if dns:
+        try:
+            answers = dns.resolver.resolve(domain, "MX")
+            mx_records = sorted([(r.preference, str(r.exchange).rstrip(".")) for r in answers], key=lambda x: x[0])
+            mxs = [m[1] for m in mx_records]
+        except Exception as e:
+            return {
+                "email": cleaned_email,
+                "domain": domain,
+                "is_deliverable": False,
+                "status": "no_mx_records",
+                "reason": f"No valid MX records found for domain '{domain}': {str(e)}"
+            }
+    else:
+        import subprocess
+        try:
+            out = subprocess.check_output(["dig", "+short", "MX", domain], timeout=5).decode()
+            for line in out.strip().split("\n"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    mxs.append(parts[1].rstrip("."))
+        except Exception:
+            pass
+
+    if not mxs:
+        return {
+            "email": cleaned_email,
+            "domain": domain,
+            "is_deliverable": False,
+            "status": "no_mx_records",
+            "reason": f"No valid MX records found for domain '{domain}'."
+        }
+
+    target_mx = mxs[0]
+    is_catch_all = False
+
+    try:
+        server = smtplib.SMTP(target_mx, 25, timeout=timeout)
+        server.ehlo_or_helo_if_needed()
+        from_addr = sender_email if sender_email else "verify@gmail.com"
+        server.mail(from_addr)
+        code, msg = server.rcpt(cleaned_email)
+        msg_str = msg.decode(errors="ignore").strip()
+
+        # Hard rejection by recipient mail server (e.g. 550 User unknown)
+        if code >= 500:
+            server.quit()
+            return {
+                "email": cleaned_email,
+                "domain": domain,
+                "target_mx": target_mx,
+                "is_deliverable": False,
+                "status": "undeliverable",
+                "smtp_code": code,
+                "reason": f"Mail server rejected recipient with code {code}: {msg_str}"
+            }
+
+        # Catch-all detection
+        if code == 250:
+            try:
+                server.rset()
+                server.mail(from_addr)
+                dummy_user = f"antigravity_verify_probe_{abs(hash(cleaned_email)) % 100000}@{domain}"
+                dummy_code, _ = server.rcpt(dummy_user)
+                if dummy_code == 250:
+                    is_catch_all = True
+            except Exception:
+                pass
+
+        server.quit()
+
+        if is_catch_all:
+            return {
+                "email": cleaned_email,
+                "domain": domain,
+                "target_mx": target_mx,
+                "is_deliverable": True,
+                "is_catch_all": True,
+                "status": "risky_catch_all",
+                "smtp_code": 250,
+                "reason": "Domain accepts all recipients (Catch-All). Domain active, individual mailbox existence cannot be strictly verified."
+            }
+        else:
+            return {
+                "email": cleaned_email,
+                "domain": domain,
+                "target_mx": target_mx,
+                "is_deliverable": True,
+                "is_catch_all": False,
+                "status": "verified",
+                "smtp_code": 250,
+                "reason": "Mailbox confirmed active and individually deliverable by mail server."
+            }
+    except Exception as e:
+        return {
+            "email": cleaned_email,
+            "domain": domain,
+            "target_mx": target_mx,
+            "is_deliverable": True,
+            "is_catch_all": False,
+            "status": "mx_verified_smtp_unreachable",
+            "reason": f"MX record verified ({target_mx}) but direct SMTP handshake timed out or was refused: {str(e)}"
+        }
+
 # ==============================================================================
 # 1. READ & INBOX TOOLS
 # ==============================================================================
 
 @mcp.tool()
-def read_inbox(limit: int = 10, unread_only: bool = False, folder: str = "INBOX") -> str:
+def read_inbox(limit: int = 100, unread_only: bool = False, folder: str = "INBOX", since_date: Optional[str] = None) -> str:
     """Reads latest emails from Inbox or a specified folder.
     
     Args:
-        limit: Number of emails to retrieve (default: 10, max: 50).
+        limit: Number of emails to retrieve (default: 100, custom value supported up to 1000).
         unread_only: If True, fetches only unread messages (default: False).
         folder: Mailbox folder name (default: 'INBOX').
+        since_date: Optional date filter (e.g. '2026-09-04' or '04-Sep-2026').
     """
-    limit = min(max(1, limit), 50)
+    custom_limit = limit if limit and limit > 0 else 100
+    limit = min(custom_limit, 1000)
     try:
         imap = get_imap_client()
         status, _ = imap.select(f'"{folder}"' if " " in folder else folder)
         if status != "OK":
             return json.dumps({"status": "error", "message": f"Folder {folder} not found."})
             
-        search_criteria = "UNSEEN" if unread_only else "ALL"
+        criteria = []
+        if unread_only:
+            criteria.append("UNSEEN")
+        if since_date:
+            imap_date = format_imap_date(since_date)
+            if imap_date:
+                criteria.append(f"SINCE {imap_date}")
+                
+        search_criteria = " ".join(criteria) if criteria else "ALL"
         status, data = imap.search(None, search_criteria)
         if not data[0]:
             imap.logout()
@@ -160,12 +322,10 @@ def read_inbox(limit: int = 10, unread_only: bool = False, folder: str = "INBOX"
         
         emails_list = []
         if status == "OK" and fetch_data:
-            idx = 0
             for item in fetch_data:
                 if isinstance(item, tuple):
                     header_msg = email.message_from_bytes(item[1])
-                    mid_str = target_ids[idx].decode("utf-8") if idx < len(target_ids) else ""
-                    idx += 1
+                    mid_str = item[0].split()[0].decode("utf-8")
                     emails_list.append({
                         "id": mid_str,
                         "from": decode_mime_words(header_msg.get("From", "")),
@@ -173,6 +333,7 @@ def read_inbox(limit: int = 10, unread_only: bool = False, folder: str = "INBOX"
                         "subject": decode_mime_words(header_msg.get("Subject", "")),
                         "date": header_msg.get("Date", "")
                     })
+            emails_list.reverse()
                 
         imap.logout()
         return json.dumps({"status": "success", "count": len(emails_list), "emails": emails_list}, indent=2)
@@ -191,7 +352,7 @@ def get_email_details(message_id: str, folder: str = "INBOX") -> str:
         imap = get_imap_client()
         imap.select(f'"{folder}"' if " " in folder else folder)
         
-        status, fetch_data = imap.fetch(message_id.encode("utf-8"), "(RFC822)")
+        status, fetch_data = imap.fetch(message_id.encode("utf-8"), "(BODY.PEEK[])")
         if status != "OK" or not fetch_data or not isinstance(fetch_data[0], tuple):
             imap.logout()
             return json.dumps({"status": "error", "message": f"Message ID {message_id} not found."})
@@ -225,26 +386,42 @@ def get_email_details(message_id: str, folder: str = "INBOX") -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 @mcp.tool()
-def search_emails(query: str, folder: str = "INBOX", limit: int = 10) -> str:
-    """Searches emails by subject, sender, or text query.
+def search_emails(query: str = "", folder: str = "INBOX", limit: int = 100, since_date: Optional[str] = None) -> str:
+    """Searches emails by subject, sender, text query, or date range.
     
     Args:
-        query: Search string or keyword (searches across Subject, From, Body).
+        query: Search string or keyword (searches across Subject, From, Body). Default is empty string.
         folder: Mailbox folder name (default: 'INBOX').
-        limit: Max results to return (default: 10).
+        limit: Max results to return (default: 100, custom value supported up to 1000).
+        since_date: Optional date filter (e.g. '2026-09-04' or '04-Sep-2026').
     """
+    custom_limit = limit if limit and limit > 0 else 100
+    limit = min(custom_limit, 1000)
     try:
         imap = get_imap_client()
         imap.select(f'"{folder}"' if " " in folder else folder)
         
-        # Search using OR across FROM, SUBJECT, and TEXT
-        search_query = f'(OR (OR FROM "{query}" SUBJECT "{query}") TEXT "{query}")'
-        status, data = imap.search(None, search_query)
+        safe_query = (query or "").replace('"', '').strip()
         
-        if status != "OK" or not data[0]:
-            status, data = imap.search(None, f'SUBJECT "{query}"')
+        date_clause = ""
+        if since_date:
+            imap_date = format_imap_date(since_date)
+            if imap_date:
+                date_clause = f" SINCE {imap_date}"
+                
+        if safe_query:
+            search_query = f'(OR (OR FROM "{safe_query}" SUBJECT "{safe_query}") TEXT "{safe_query}"){date_clause}'
+            status, data = imap.search(None, search_query)
+            if status != "OK" or not data or not data[0]:
+                search_query = f'SUBJECT "{safe_query}"{date_clause}'
+                status, data = imap.search(None, search_query)
+        elif date_clause:
+            search_query = date_clause.strip()
+            status, data = imap.search(None, search_query)
+        else:
+            status, data = imap.search(None, "ALL")
             
-        if not data[0]:
+        if not data or not data[0]:
             imap.logout()
             return json.dumps({"status": "success", "count": 0, "emails": []})
             
@@ -258,12 +435,10 @@ def search_emails(query: str, folder: str = "INBOX", limit: int = 10) -> str:
         
         results = []
         if status == "OK" and fetch_data:
-            idx = 0
             for item in fetch_data:
                 if isinstance(item, tuple):
                     header_msg = email.message_from_bytes(item[1])
-                    mid_str = target_ids[idx].decode("utf-8") if idx < len(target_ids) else ""
-                    idx += 1
+                    mid_str = item[0].split()[0].decode("utf-8")
                     results.append({
                         "id": mid_str,
                         "from": decode_mime_words(header_msg.get("From", "")),
@@ -271,6 +446,7 @@ def search_emails(query: str, folder: str = "INBOX", limit: int = 10) -> str:
                         "subject": decode_mime_words(header_msg.get("Subject", "")),
                         "date": header_msg.get("Date", "")
                     })
+            results.reverse()
                 
         imap.logout()
         return json.dumps({"status": "success", "count": len(results), "emails": results}, indent=2)
@@ -282,8 +458,29 @@ def search_emails(query: str, folder: str = "INBOX", limit: int = 10) -> str:
 # ==============================================================================
 
 @mcp.tool()
-def send_email(to: str, subject: str, body: str, cc: Optional[str] = None, bcc: Optional[str] = None, html_body: Optional[str] = None) -> str:
-    """Sends an email dynamically via SMTP.
+def verify_email_deliverability(email_address: str, timeout: int = 8) -> str:
+    """Performs deep pre-flight email deliverability verification before sending.
+    
+    Checks:
+    1. RFC syntax format
+    2. DNS MX records existence
+    3. Zero-send SMTP handshake with the target MX server (RCPT TO probe)
+    4. Catch-all domain detection
+    
+    Args:
+        email_address: The target email address to verify.
+        timeout: Socket timeout in seconds for SMTP probe (default: 8).
+    """
+    try:
+        cfg = load_config()
+        result = check_email_deliverability(email_address, cfg.get("sender_email", ""), timeout=timeout)
+        return json.dumps({"status": "success", "deliverability": result}, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+@mcp.tool()
+def send_email(to: str, subject: str, body: str, cc: Optional[str] = None, bcc: Optional[str] = None, html_body: Optional[str] = None, verify_deliverability: bool = True) -> str:
+    """Sends an email dynamically via SMTP with pre-send deliverability protection.
     
     Args:
         to: Recipient email address (or comma-separated addresses).
@@ -292,10 +489,29 @@ def send_email(to: str, subject: str, body: str, cc: Optional[str] = None, bcc: 
         cc: Optional CC email address.
         bcc: Optional BCC email address.
         html_body: Optional HTML formatted content of the email.
+        verify_deliverability: If True (default), verifies mailbox deliverability before sending to prevent bounces.
     """
     try:
         cfg = load_config()
         sender_email = cfg["sender_email"]
+        
+        recipients = [r.strip() for r in to.split(",") if r.strip()]
+        if cc:
+            recipients.extend([r.strip() for r in cc.split(",") if r.strip()])
+        if bcc:
+            recipients.extend([r.strip() for r in bcc.split(",") if r.strip()])
+
+        if verify_deliverability:
+            for rec in recipients:
+                ver_res = check_email_deliverability(rec, sender_email)
+                if not ver_res["is_deliverable"]:
+                    return json.dumps({
+                        "status": "blocked",
+                        "error_code": "PRE_SEND_VERIFICATION_FAILED",
+                        "blocked_recipient": rec,
+                        "verification_details": ver_res,
+                        "message": f"Dispatch blocked for '{rec}': {ver_res['reason']}. Prevented bounce to protect sender reputation."
+                    }, indent=2)
         
         msg = MIMEMultipart("alternative")
         msg["From"] = sender_email
@@ -307,12 +523,6 @@ def send_email(to: str, subject: str, body: str, cc: Optional[str] = None, bcc: 
         msg.attach(MIMEText(body, "plain", "utf-8"))
         if html_body:
             msg.attach(MIMEText(html_body, "html", "utf-8"))
-        
-        recipients = [r.strip() for r in to.split(",") if r.strip()]
-        if cc:
-            recipients.extend([r.strip() for r in cc.split(",") if r.strip()])
-        if bcc:
-            recipients.extend([r.strip() for r in bcc.split(",") if r.strip()])
             
         server = smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"])
         server.login(sender_email, cfg["app_password"])
@@ -324,8 +534,8 @@ def send_email(to: str, subject: str, body: str, cc: Optional[str] = None, bcc: 
         return json.dumps({"status": "error", "message": str(e)})
 
 @mcp.tool()
-def send_email_with_attachment(to: str, subject: str, body: str, file_path: str, cc: Optional[str] = None, html_body: Optional[str] = None) -> str:
-    """Sends an email with a file attachment dynamically.
+def send_email_with_attachment(to: str, subject: str, body: str, file_path: str, cc: Optional[str] = None, html_body: Optional[str] = None, verify_deliverability: bool = True) -> str:
+    """Sends an email with a file attachment dynamically with pre-send deliverability protection.
     
     Args:
         to: Recipient email address.
@@ -334,6 +544,7 @@ def send_email_with_attachment(to: str, subject: str, body: str, file_path: str,
         file_path: Local path to any file to attach.
         cc: Optional CC address.
         html_body: Optional HTML formatted email body.
+        verify_deliverability: If True (default), verifies mailbox deliverability before sending to prevent bounces.
     """
     try:
         cfg = load_config()
@@ -341,6 +552,22 @@ def send_email_with_attachment(to: str, subject: str, body: str, file_path: str,
         
         if not os.path.exists(file_path):
             return json.dumps({"status": "error", "message": f"Attachment file not found at: {file_path}"})
+
+        recipients = [r.strip() for r in to.split(",") if r.strip()]
+        if cc:
+            recipients.extend([r.strip() for r in cc.split(",") if r.strip()])
+
+        if verify_deliverability:
+            for rec in recipients:
+                ver_res = check_email_deliverability(rec, sender_email)
+                if not ver_res["is_deliverable"]:
+                    return json.dumps({
+                        "status": "blocked",
+                        "error_code": "PRE_SEND_VERIFICATION_FAILED",
+                        "blocked_recipient": rec,
+                        "verification_details": ver_res,
+                        "message": f"Dispatch blocked for '{rec}': {ver_res['reason']}. Prevented bounce to protect sender reputation."
+                    }, indent=2)
             
         msg = MIMEMultipart("mixed")
         msg["From"] = sender_email
@@ -362,10 +589,6 @@ def send_email_with_attachment(to: str, subject: str, body: str, file_path: str,
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", f"attachment; filename= {filename}")
             msg.attach(part)
-            
-        recipients = [r.strip() for r in to.split(",") if r.strip()]
-        if cc:
-            recipients.extend([r.strip() for r in cc.split(",") if r.strip()])
             
         server = smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"])
         server.login(sender_email, cfg["app_password"])
